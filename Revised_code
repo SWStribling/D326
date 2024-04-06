@@ -1,0 +1,180 @@
+/* Our rental table has a lot of key information to prevent duplicating data,
+	so let's just add to that to get started: */
+ALTER TABLE rental
+ADD COLUMN days_checked_out INTEGER;
+
+-- SELECT * FROM rental;
+
+-- Update the new column with our days checked out
+UPDATE rental
+SET days_checked_out = DATE_PART('day', return_date - rental_date);
+
+
+-- Create a function to determine the returned status
+CREATE OR REPLACE FUNCTION determine_returned_status(days_checked_out INTEGER, rental_duration INTEGER)
+RETURNS VARCHAR(50)
+AS $$
+DECLARE
+    returned_status VARCHAR(50);
+BEGIN
+    -- The guts of the function
+    IF days_checked_out IS NULL THEN
+        returned_status := 'Not yet returned';
+    ELSIF days_checked_out > rental_duration THEN
+        returned_status := 'Returned late';
+    ELSE
+        returned_status := 'Returned early';
+    END IF;
+
+    -- Return the determined returned status
+    RETURN returned_status;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+-- Now, let's create our table of customers, their rental, and fees due (Detailed table)
+DROP TABLE IF EXISTS late_fees;
+
+CREATE TABLE late_fees AS
+SELECT
+	r.rental_id,
+    c.first_name || ' ' || c.last_name AS customer_name,
+	c.customer_id,
+    f.title,
+	f.film_id,
+    determine_returned_status(r.days_checked_out, f.rental_duration) AS rental_status,
+    r.days_checked_out - f.rental_duration AS days_overdue,
+    f.rental_duration,
+	DATE(r.rental_date) AS rental_date,
+    DATE(r.return_date) AS return_date,
+    f.rental_rate,
+    CASE
+        WHEN determine_returned_status(r.days_checked_out, f.rental_duration) = 'Returned late'
+		THEN CAST((f.rental_rate * 0.10 * (r.days_checked_out - f.rental_duration)) AS NUMERIC(5,2))
+        ELSE 0
+    END AS late_fee,
+    (f.rental_rate + CASE WHEN determine_returned_status(r.days_checked_out, f.rental_duration) = 'Returned late'
+	 	THEN CAST((f.rental_rate * 0.10 * (r.days_checked_out - f.rental_duration)) AS NUMERIC(5,2))
+	 	ELSE 0
+	END) AS total_due,
+    c.email
+FROM
+    rental r
+	JOIN customer c ON r.customer_id = c.customer_id
+    JOIN inventory i ON r.inventory_id = i.inventory_id
+    JOIN film f ON i.film_id = f.film_id;
+
+-- SELECT * FROM late_fees;
+
+
+-- How much money could be made on late fees (based on current data)?
+SELECT TO_CHAR(SUM(total_due) - SUM(rental_rate), '$999,999,999.99') AS profit_from_late_fees
+	FROM late_fees
+	WHERE late_fee > 0;
+
+-- Summary table; we will do it based on total amount due per customer
+DROP TABLE IF EXISTS customer_dues;
+CREATE TABLE customer_dues AS
+	SELECT
+		customer_id,
+		customer_name,
+		SUM(total_due)
+	FROM late_fees
+	GROUP BY customer_id, customer_name;
+
+-- SELECT * FROM customer_dues;
+
+
+-- Trigger Time
+-- Let's build the trigger function
+CREATE OR REPLACE FUNCTION update_customer_dues()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Update customer dues based on changes in late_fees table
+    DELETE FROM customer_dues;
+    INSERT INTO customer_dues
+    SELECT
+		customer_id,
+		customer_name,
+		SUM(total_due)
+	FROM late_fees
+	GROUP BY customer_id, customer_name;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Create the actual trigger
+CREATE TRIGGER late_fees_trigger
+	AFTER INSERT OR UPDATE OR DELETE ON late_fees
+	FOR EACH STATEMENT
+	EXECUTE FUNCTION update_customer_dues();
+
+/*
+-- Trigger test
+SELECT * FROM customer_dues WHERE customer_id=462;
+-- customer Warren Sherrod owes 127.56
+
+DELETE FROM late_fees WHERE customer_id = 462;
+
+SELECT * FROM customer_dues WHERE customer_id=462;
+-- customer Warren Sherrod with id: 462, no longer exists
+
+SELECT * FROM late_fees WHERE customer_id=462;
+*/
+
+-- Stored procedure
+CREATE OR REPLACE PROCEDURE refresh_data()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Clear the content of the late_fees table (our detailed table)
+    DELETE FROM late_fees;
+
+    -- Now let's copy/paste a bunch of stuff from the late_fees table creation
+    INSERT INTO late_fees
+    SELECT
+        r.rental_id,
+   		c.first_name || ' ' || c.last_name AS customer_name,
+		c.customer_id,
+		f.title,
+		f.film_id,
+		determine_returned_status(r.days_checked_out, f.rental_duration) AS rental_status,
+		r.days_checked_out - f.rental_duration AS days_overdue,
+		f.rental_duration,
+		DATE(r.rental_date) AS rental_date,
+		DATE(r.return_date) AS return_date,
+		f.rental_rate,
+		CASE
+			WHEN determine_returned_status(r.days_checked_out, f.rental_duration) = 'Returned late'
+			THEN CAST((f.rental_rate * 0.10 * (r.days_checked_out - f.rental_duration)) AS NUMERIC(5,2))
+			ELSE 0
+		END AS late_fee,
+		(f.rental_rate + CASE WHEN determine_returned_status(r.days_checked_out, f.rental_duration) = 'Returned late'
+			THEN CAST((f.rental_rate * 0.10 * (r.days_checked_out - f.rental_duration)) AS NUMERIC(5,2))
+			ELSE 0
+		END) AS total_due,
+		c.email
+	FROM
+		rental r
+		JOIN customer c ON r.customer_id = c.customer_id
+		JOIN inventory i ON r.inventory_id = i.inventory_id
+		JOIN film f ON i.film_id = f.film_id;
+
+    -- And let's do the same thing for our summary table
+    DELETE FROM customer_dues;
+
+    INSERT INTO customer_dues
+    SELECT
+        customer_id,
+        customer_name,
+        SUM(total_due)
+    FROM late_fees
+    GROUP BY customer_id, customer_name;
+END;
+$$;
+
+/* Test
+CALL refresh_data();
+SELECT * FROM customer_dues WHERE customer_id=462;
+*/
